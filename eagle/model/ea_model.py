@@ -2,6 +2,7 @@ import copy
 import json
 import time
 
+from flask import logging
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
@@ -17,8 +18,8 @@ from .modeling_qwen3_kv import Qwen3ForCausalLM as KVQwen3ForCausalLM
 from .utils import *
 from .kv_cache import initialize_past_key_values
 
-from .cnets import Model
-from .cnets1 import Model as Model1
+from .cnets import Model #eagle2
+from .cnets1 import Model as Model1 #eagle3
 from .configs import EConfig
 
 
@@ -98,6 +99,7 @@ class EaModel(nn.Module):
             **kwargs,
     ):
         # assert Type=="LLaMA" or "Mixtral"
+        logging.info(f"Loading base model from {base_model_path}...")
         Type = AutoConfig.from_pretrained(base_model_path).architectures[0]
 
         if Type == 'LlamaForCausalLM':
@@ -133,6 +135,8 @@ class EaModel(nn.Module):
             if not os.path.exists(load_model_path):
                 load_model_path = hf_hub_download(ea_model_path, "model.safetensors")
             ea_layer_state_dict = load_file(load_model_path)
+        # cls是当前类的引用
+        logging.info("Init EA model")
         model = cls(
             use_eagle3,
             base_model,
@@ -146,6 +150,7 @@ class EaModel(nn.Module):
         )
 
         if total_token == -1:
+            logging.info("Auto-tuning total token length...")
             device = model.base_model.model.layers[0].self_attn.q_proj.weight.device
             cans = [40, 48, 50, 56, 60]
             x = [1, 1.05, 1.07, 1.1, 1.13]
@@ -177,9 +182,10 @@ class EaModel(nn.Module):
             output_orig=False,
             position_ids=None,
     ):
-
+        # 可能只是一个基础的 base model forward接口，而非在这里掉eagle的main inference
         with torch.inference_mode():
             # Pass input through the base model
+            logging.info("Forwarding through base model...")
             outputs = self.base_model.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -225,12 +231,14 @@ class EaModel(nn.Module):
 
         # Initialize the past key and value states
         if hasattr(self, "past_key_values"):
+            logging.info("Using existing past key values")
             past_key_values = self.past_key_values
             past_key_values_data = self.past_key_values_data
             current_length_data = self.current_length_data
             # Reset the past key and value states
             current_length_data.zero_()
         else:
+            logging.info("Initializing past key values")
             (
                 past_key_values,
                 past_key_values_data,
@@ -241,8 +249,12 @@ class EaModel(nn.Module):
             self.current_length_data = current_length_data
 
         input_len = input_ids.shape[1]
+        logging.info("reset_tree_mode")
+        # 为啥是个空函数...可能是标识某事
         reset_tree_mode(self)
         # prefill
+        # 这里prefill的是draft model还是target model？应该是target罢
+        logging.info("Initializing tree")
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
@@ -426,17 +438,20 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
+        logging.info("Initializing tree, where target model prefill and draft model generate the initial tree.")
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
+        logging.info(f"Starting EA generation loop, with {max_length} max length.")
         for idx in range(max_length):
             # with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
             # with Timer("tree_decoding"):
+            logging.info("Performing tree decoding with current draft tokens.")
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -447,13 +462,18 @@ class EaModel(nn.Module):
             )
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
+            logging.info("Tree draft token to linear draft tokens conversion.")
+            logging.info(f"Draft tokens shape before padding: {draft_tokens.shape}")
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
             candidates = draft_tokens[0, retrieve_indices]
+            logging.info(f"Candidates draft shape: {candidates.shape}")
+            logging.info("Evaluating candidate to select best candidate tokens.")
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
-            # print(accept_length)
+            logging.info(f"Accept length: {accept_length}")
             # with Timer("update_inference_inputs"):
+            logging.info("Updating inference inputs based on best candidate selection.")
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
                 candidates,

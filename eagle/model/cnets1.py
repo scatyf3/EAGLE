@@ -23,6 +23,7 @@ import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 import math
 from typing import List, Optional, Tuple, Union
+from flask import logging
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
@@ -476,9 +477,17 @@ class Model(nn.Module):
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
+        
+        logging.info("Loading embedding weights from pretrained model...")
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         if load_emb:
+            '''
+            为了保证 Draft Model 看到的“词向量空间”与 Target Model 完全一致。
+            在投机采样中，Draft Model 需要接收 Target Model 产生的 Token 并将其转换回 Embedding。如果两者空间不一致，特征预测就会失效
+            AKA，插图里的 将token embedding和hidden state合在一起的
+            '''
+
+
             from safetensors import safe_open
             import json
             try:
@@ -519,8 +528,9 @@ class Model(nn.Module):
         # print("depth",depth)
         # print("top_k",top_k)
         # print("threshold",threshold)
-
+        logging.info("use a lightwise decoder layer to predict tokens")
         self.layers = nn.ModuleList([LlamaDecoderLayer(config, index) for index in range(config.num_hidden_layers)])
+        logging.info("fuse layer for embedding and hidden states")
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=bias)
         self.act = ACT2FN[config.hidden_act]
         self.logsoftmax = nn.LogSoftmax(dim=-1)
@@ -581,10 +591,13 @@ class Model(nn.Module):
             return_dict: Optional[bool] = None,
             std=None
     ):
+        logging.info("forwarding lightwise draft...")
+        # 一些misc，解tensor shape
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
+        logging.info(f"getting input embeddings {inputs_embeds.shape if inputs_embeds is not None else 'None'} from input ids with shape {input_ids.shape}...")
         with torch.no_grad():
             inputs_embeds = self.embed_tokens(input_ids)
             # inputs_embeds = inputs_embeds.detach()
@@ -593,6 +606,7 @@ class Model(nn.Module):
         #     noise = torch.randn(inputs_embeds.size(),device=inputs_embeds.device) * std
         #     inputs_embeds=inputs_embeds+noise
 
+        # maybe some misc about kv and attention mask
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
@@ -619,12 +633,13 @@ class Model(nn.Module):
         #        use_cache = False
 
         # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
+        logging.info(f"fusing input embeddings {inputs_embeds.shape if inputs_embeds is not None else 'None'} and hidden states {hidden_states.shape}...")
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
         hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
 
         all_hidden_states = () if output_hidden_states else None
         next_decoder_cache = () if use_cache else None
-
+        logging.info(f"passing through {len(self.layers)} decoder layers...")
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -671,6 +686,9 @@ class Model(nn.Module):
 
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
+        '''
+\       这部分好像在main ea model里妹用到？
+        '''
 
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens

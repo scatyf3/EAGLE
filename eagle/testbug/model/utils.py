@@ -1,6 +1,7 @@
 import copy
 import random
 import time
+from flask import logging
 import torch
 
 # TODO
@@ -225,6 +226,7 @@ def generate_tree_buffers(tree_choices, device="cuda"):
 
 
 def initialize_tree(input_ids, model, tree_attn_mask, past_key_values, logits_processor):
+    logging.info("Initializing tree buffers by forwarding through the target model...")
     position_ids = torch.arange(input_ids.shape[1], dtype=torch.long, device=input_ids.device)
     tree_logits, outputs, logits, hidden_state, sample_token = model(
         input_ids, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor,
