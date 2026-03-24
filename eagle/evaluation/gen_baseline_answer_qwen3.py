@@ -134,6 +134,158 @@ def truncate_input_ids(input_ids, max_input_tokens):
     return input_ids
 
 
+def _reset_cuda_memory_peak_stats(enabled=True):
+    if not enabled or not torch.cuda.is_available():
+        return
+    for dev_idx in range(torch.cuda.device_count()):
+        try:
+            torch.cuda.reset_peak_memory_stats(dev_idx)
+        except Exception:
+            pass
+
+
+def _collect_weight_bytes_by_device(model):
+    out = {}
+
+    for p in model.parameters():
+        if not p.is_cuda:
+            continue
+        dev = str(p.device)
+        out[dev] = out.get(dev, 0) + int(p.numel() * p.element_size())
+
+    for b in model.buffers():
+        if not b.is_cuda:
+            continue
+        dev = str(b.device)
+        out[dev] = out.get(dev, 0) + int(b.numel() * b.element_size())
+
+    return out
+
+
+def _collect_kv_bytes_by_device(model):
+    used = {}
+    capacity = {}
+
+    if not hasattr(model, "past_key_values"):
+        return {"used": used, "capacity": capacity}
+
+    try:
+        for layer_kv in model.past_key_values:
+            key_cache, value_cache = layer_kv
+            for cache in (key_cache, value_cache):
+                data = cache.data
+                if not data.is_cuda:
+                    continue
+
+                dev = str(data.device)
+                cap_bytes = int(data.numel() * data.element_size())
+                capacity[dev] = capacity.get(dev, 0) + cap_bytes
+
+                cur_len = int(cache.current_length.item()) if hasattr(cache, "current_length") else data.shape[2]
+                if data.dim() >= 4:
+                    used_len = max(0, min(cur_len, int(data.shape[2])))
+                    used_numel = int(data.shape[0] * data.shape[1] * used_len * data.shape[3])
+                else:
+                    used_numel = int(data.numel())
+                used_bytes = int(used_numel * data.element_size())
+                used[dev] = used.get(dev, 0) + used_bytes
+    except Exception:
+        return {"used": used, "capacity": capacity}
+
+    return {"used": used, "capacity": capacity}
+
+
+def _collect_cuda_peak_by_device():
+    out = {}
+    if not torch.cuda.is_available():
+        return out
+
+    for dev_idx in range(torch.cuda.device_count()):
+        dev = f"cuda:{dev_idx}"
+        try:
+            out[dev] = {
+                "current_allocated": int(torch.cuda.memory_allocated(dev_idx)),
+                "peak_allocated": int(torch.cuda.max_memory_allocated(dev_idx)),
+                "current_reserved": int(torch.cuda.memory_reserved(dev_idx)),
+                "peak_reserved": int(torch.cuda.max_memory_reserved(dev_idx)),
+            }
+        except Exception:
+            out[dev] = {
+                "current_allocated": 0,
+                "peak_allocated": 0,
+                "current_reserved": 0,
+                "peak_reserved": 0,
+            }
+    return out
+
+
+def _collect_memory_profile(model, enabled=True):
+    if not enabled:
+        return {"enabled": False}
+
+    if not torch.cuda.is_available():
+        return {
+            "enabled": True,
+            "available": False,
+            "reason": "cuda_not_available",
+        }
+
+    weight_by_dev = _collect_weight_bytes_by_device(model)
+    kv_by_dev = _collect_kv_bytes_by_device(model)
+    peak_by_dev = _collect_cuda_peak_by_device()
+
+    devices = sorted(set(list(weight_by_dev.keys()) + list(kv_by_dev["used"].keys()) + list(peak_by_dev.keys())))
+    per_device = {}
+
+    total_weight = 0
+    total_kv_used = 0
+    total_kv_capacity = 0
+    total_peak_allocated = 0
+    total_peak_reserved = 0
+    total_activation_peak_est = 0
+
+    for dev in devices:
+        w = int(weight_by_dev.get(dev, 0))
+        kv_u = int(kv_by_dev["used"].get(dev, 0))
+        kv_c = int(kv_by_dev["capacity"].get(dev, 0))
+        peak = peak_by_dev.get(dev, {})
+        p_alloc = int(peak.get("peak_allocated", 0))
+        p_res = int(peak.get("peak_reserved", 0))
+        act_est = max(0, p_alloc - w - kv_u)
+
+        per_device[dev] = {
+            "weight_bytes": w,
+            "kv_cache_used_bytes": kv_u,
+            "kv_cache_capacity_bytes": kv_c,
+            "activation_peak_est_bytes": int(act_est),
+            "peak_allocated_bytes": p_alloc,
+            "peak_reserved_bytes": p_res,
+            "current_allocated_bytes": int(peak.get("current_allocated", 0)),
+            "current_reserved_bytes": int(peak.get("current_reserved", 0)),
+        }
+
+        total_weight += w
+        total_kv_used += kv_u
+        total_kv_capacity += kv_c
+        total_peak_allocated += p_alloc
+        total_peak_reserved += p_res
+        total_activation_peak_est += int(act_est)
+
+    return {
+        "enabled": True,
+        "available": True,
+        "totals": {
+            "weight_bytes": int(total_weight),
+            "kv_cache_used_bytes": int(total_kv_used),
+            "kv_cache_capacity_bytes": int(total_kv_capacity),
+            "activation_peak_est_bytes": int(total_activation_peak_est),
+            "peak_allocated_bytes": int(total_peak_allocated),
+            "peak_reserved_bytes": int(total_peak_reserved),
+        },
+        "per_device": per_device,
+    }
+
+
 def run_eval(
     base_model_path,
     ea_model_path,
@@ -291,6 +443,7 @@ def get_model_answers(
             idxs = []
             new_tokens = []
             wall_time = []
+            _reset_cuda_memory_peak_stats(args.record_memory_profile)
             for j in range(len(question["turns"])):
                 qs = question["turns"][j]
                 conv.append_message(conv.roles[0], qs)
@@ -368,6 +521,8 @@ def get_model_answers(
                 wall_time.append(total_time)
                 conv.messages[-1][-1] = output
 
+            memory_profile = _collect_memory_profile(model, args.record_memory_profile)
+
             choices.append(
                 {
                     "index": i,
@@ -375,6 +530,7 @@ def get_model_answers(
                     "idxs": idxs,
                     "new_tokens": new_tokens,
                     "wall_time": wall_time,
+                    "memory_profile": memory_profile,
                 }
             )
 
@@ -528,6 +684,12 @@ if __name__ == "__main__":
         type=str,
         default=f"{parent_dir}/outputs/attn_debug",
         help="Directory to save attention debug snapshots.",
+    )
+    parser.add_argument(
+        "--record-memory-profile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record GPU memory profile (weights/KV cache/activation estimate) at the end of each choice inference.",
     )
 
     args = parser.parse_args()
