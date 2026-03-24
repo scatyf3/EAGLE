@@ -1,15 +1,11 @@
-"""Generate answers with local models.
+"""Generate baseline autoregressive answers with Qwen3 models.
 
 Usage:
-python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
+python -m eagle.evaluation.gen_baseline_answer_qwen3 --base-model-path Qwen/Qwen3-1.7B --ea-model-path AngelSlim/Qwen3-1.7B_eagle3 --bench-name mt_bench
 """
 import argparse
 import json
 import os
-import random
-script_dir = os.path.dirname(__file__)
-parent_dir = os.path.dirname(script_dir)
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 import time
 
 import shortuuid
@@ -19,12 +15,14 @@ from tqdm import tqdm
 
 try:
     from ..model.ea_model import EaModel
-    from ..model.kv_cache import initialize_past_key_values
     from ..model.utils import *
-except:
+except Exception:
     from eagle.model.ea_model import EaModel
-    from eagle.model.kv_cache import initialize_past_key_values
     from eagle.model.utils import *
+
+
+script_dir = os.path.dirname(__file__)
+parent_dir = os.path.dirname(script_dir)
 
 
 def _sanitize_filename(name):
@@ -87,7 +85,7 @@ def _save_kv_debug_snapshot(
     torch.save(payload, os.path.join(out_dir, out_name))
 
 
-def _save_draft_attn_debug_snapshot(
+def _save_attn_debug_snapshot(
     model,
     args,
     question_id,
@@ -98,13 +96,13 @@ def _save_draft_attn_debug_snapshot(
     generated_text,
     generated_token_ids,
 ):
-    if not args.draft_attn_debug:
+    if not args.attn_debug:
         return
 
     model_part = _sanitize_filename(args.model_id)
     bench_part = _sanitize_filename(args.bench_name)
     qid_part = _sanitize_filename(question_id)
-    out_dir = os.path.join(args.draft_attn_debug_dir, bench_part, model_part, qid_part)
+    out_dir = os.path.join(args.attn_debug_dir, bench_part, model_part, qid_part)
     os.makedirs(out_dir, exist_ok=True)
 
     payload = {
@@ -119,7 +117,7 @@ def _save_draft_attn_debug_snapshot(
         "generated_text": generated_text,
         "prompt_token_ids": [int(x) for x in prompt_token_ids],
         "generated_token_ids": [int(x) for x in generated_token_ids],
-        "draft_accepted_attn_trace": getattr(model, "last_draft_attn_trace", None),
+        "accepted_token_attn_trace": getattr(model, "last_attn_trace", None),
     }
 
     out_name = f"choice_{choice_idx:02d}_turn_{turn_idx:02d}.pt"
@@ -136,127 +134,24 @@ def truncate_input_ids(input_ids, max_input_tokens):
     return input_ids
 
 
-def parse_head_list(head_csv):
-    if not head_csv:
-        return None
-    out = []
-    for p in str(head_csv).split(","):
-        p = p.strip()
-        if not p:
-            continue
-        try:
-            out.append(int(p))
-        except Exception:
-            pass
-    return out if out else None
-
-
-def select_random_heads(num_heads, count, seed):
-    """Select `count` unique random attention heads from [0, num_heads)."""
-    if count is None or int(count) <= 0:
-        return None
-    n = int(num_heads)
-    k = min(int(count), n)
-    if k <= 0 or n <= 0:
-        return None
-    rng = random.Random(int(seed))
-    heads = sorted(rng.sample(list(range(n)), k))
-    return heads if heads else None
-
-
-def _get_linear_timing_model(model, component="target"):
-    if component == "target":
-        candidate = getattr(model, "base_model", None)
-    elif component == "draft":
-        candidate = getattr(model, "ea_layer", None)
-    else:
-        candidate = None
-
-    if candidate is None:
-        return None
-    if hasattr(candidate, "reset_linear_timing_stats") and hasattr(candidate, "get_linear_timing_stats"):
-        return candidate
-    return None
-
-
-def _reset_linear_timing_stats(model):
-    status = {}
-    for comp in ("target", "draft"):
-        timing_model = _get_linear_timing_model(model, component=comp)
-        if timing_model is None:
-            status[comp] = False
-            continue
-        try:
-            timing_model.reset_linear_timing_stats()
-            status[comp] = True
-        except Exception as e:
-            print(f"Warning: failed to reset {comp} linear timing stats: {e}")
-            status[comp] = False
-    return status
-
-
-def _get_linear_timing_stats(model, component="target"):
-    timing_model = _get_linear_timing_model(model, component=component)
-    if timing_model is None:
-        return None
-    try:
-        raw = timing_model.get_linear_timing_stats()
-        return {
-            "self_attn_s": float(raw.get("self_attn_s", 0.0)),
-            "other_linear_s": float(raw.get("other_linear_s", 0.0)),
-            "self_attn_ops": int(raw.get("self_attn_ops", 0)),
-            "other_linear_ops": int(raw.get("other_linear_ops", 0)),
-            "steps": int(raw.get("steps", 0)),
-        }
-    except Exception as e:
-        print(f"Warning: failed to read {component} linear timing stats: {e}")
-        return None
-
-
-def _collect_linear_timing_summary(model, enabled):
-    out = {}
-    for comp in ("target", "draft"):
-        stats = _get_linear_timing_stats(model, component=comp)
-        if stats is None:
-            out[comp] = {
-                "enabled": bool(enabled),
-                "available": False,
-            }
-            continue
-        comp_out = {
-            "enabled": bool(enabled),
-            "available": True,
-        }
-        comp_out.update(stats)
-        out[comp] = comp_out
-    return out
-
-
-
 def run_eval(
-        base_model_path,
-        ea_model_path,
-        model_id,
-        question_file,
-        question_begin,
-        question_end,
-        answer_file,
-        max_new_token,
-        num_choices,
-        num_gpus_per_model,
-        num_gpus_total,
-        max_gpu_memory,
-        temperature,
-        args
+    base_model_path,
+    ea_model_path,
+    model_id,
+    question_file,
+    question_begin,
+    question_end,
+    answer_file,
+    max_new_token,
+    num_choices,
+    num_gpus_per_model,
+    num_gpus_total,
+    max_gpu_memory,
+    temperature,
+    args,
 ):
     questions = load_questions(question_file, question_begin, question_end)
-    # random shuffle the questions to balance the loading
-    # random.shuffle(questions)
-    shuffled_ids = [q["question_id"] for q in questions]
-    # with open(f"data/{args.bench_name}/model_ids/{args.model_id}.shuffled_ids", "w") as fout:
-    #     json.dump(shuffled_ids, fout)
 
-    # Split the question file into `num_gpus` files
     assert num_gpus_total % num_gpus_per_model == 0
     use_ray = num_gpus_total // num_gpus_per_model > 1
 
@@ -267,7 +162,7 @@ def run_eval(
     else:
         get_answers_func = get_model_answers
 
-    chunk_size = len(questions) // (num_gpus_total // num_gpus_per_model)  # // 2
+    chunk_size = len(questions) // (num_gpus_total // num_gpus_per_model)
     ans_handles = []
     for i in range(0, len(questions), chunk_size):
         ans_handles.append(
@@ -275,14 +170,14 @@ def run_eval(
                 base_model_path,
                 ea_model_path,
                 model_id,
-                questions[i: i + chunk_size],
+                questions[i : i + chunk_size],
                 answer_file,
                 max_new_token,
                 num_choices,
                 num_gpus_per_model,
                 max_gpu_memory,
                 temperature,
-                args
+                args,
             )
         )
 
@@ -292,20 +187,18 @@ def run_eval(
 
 @torch.inference_mode()
 def get_model_answers(
-        base_model_path,
-        ea_model_path,
-        model_id,
-        questions,
-        answer_file,
-        max_new_token,
-        num_choices,
-        num_gpus_per_model,
-        max_gpu_memory,
-        temperature,
-        args
+    base_model_path,
+    ea_model_path,
+    model_id,
+    questions,
+    answer_file,
+    max_new_token,
+    num_choices,
+    num_gpus_per_model,
+    max_gpu_memory,
+    temperature,
+    args,
 ):
-    # temperature = 0.0
-
     model = EaModel.from_pretrained(
         base_model_path=base_model_path,
         ea_model_path=ea_model_path,
@@ -314,56 +207,16 @@ def get_model_answers(
         top_k=args.top_k,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
-        # load_in_8bit=True,
         device_map="auto",
         use_eagle3=args.use_eagle3,
     )
 
     tokenizer = model.get_tokenizer()
-
-    if temperature > 1e-5:
-        logits_processor = prepare_logits_processor(temperature=temperature)
-    else:
-        logits_processor = None
-
     model.eval()
-    print('Check model training state:', model.training)
-    os.environ["EAGLE_RECORD_LINEAR_TIME"] = "1" if args.record_linear_time else "0"
-    print(f"EAGLE_RECORD_LINEAR_TIME={os.environ['EAGLE_RECORD_LINEAR_TIME']}")
+    print("Check model training state:", model.training)
 
-    selected_streaming_heads = args.streaming_protected_draft_heads
-    if args.streaming_random_draft_head_count > 0:
-        try:
-            # Support both draft backbones:
-            # - cnets1.Model: ea_layer.layers[0].self_attn.num_heads
-            # - cnets.Model:  ea_layer.midlayer.self_attn.num_heads
-            num_draft_heads = None
-            if hasattr(model.ea_layer, "layers") and len(model.ea_layer.layers) > 0:
-                num_draft_heads = int(model.ea_layer.layers[0].self_attn.num_heads)
-            elif hasattr(model.ea_layer, "midlayer") and hasattr(model.ea_layer.midlayer, "self_attn"):
-                num_draft_heads = int(model.ea_layer.midlayer.self_attn.num_heads)
-            elif hasattr(model.ea_layer, "config") and hasattr(model.ea_layer.config, "num_attention_heads"):
-                num_draft_heads = int(model.ea_layer.config.num_attention_heads)
-            else:
-                raise AttributeError("Cannot infer draft num_heads from ea_layer")
-
-            selected_streaming_heads = select_random_heads(
-                num_heads=num_draft_heads,
-                count=args.streaming_random_draft_head_count,
-                seed=args.streaming_random_seed,
-            )
-            print(
-                f"Streaming random protected draft heads enabled: "
-                f"count={args.streaming_random_draft_head_count}, "
-                f"seed={args.streaming_random_seed}, "
-                f"selected={selected_streaming_heads}"
-            )
-        except Exception as e:
-            print(f"Warning: failed to select random streaming protected heads: {e}")
-            selected_streaming_heads = args.streaming_protected_draft_heads
-
-    cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-    print('CUDA VISIBLE DEVICES:', cuda_visible_devices)
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    print("CUDA VISIBLE DEVICES:", cuda_visible_devices)
 
     question = questions[0]
 
@@ -384,34 +237,22 @@ def get_model_answers(
             input_ids = tokenizer([prompt]).input_ids
             input_ids = truncate_input_ids(input_ids, args.max_input_tokens)
 
-            # try:
             torch.cuda.synchronize()
             start_time = time.time()
-
-            output_ids, new_token, idx, _pf = model.eagenerate(
+            output_ids, new_token, idx = model.naivegenerate(
                 torch.as_tensor(input_ids).cuda(),
                 temperature=temperature,
                 max_length=args.max_length,
                 max_new_tokens=max_new_token,
-                streaming_kv_prune=args.streaming_kv_prune,
-                streaming_sink_size=args.streaming_sink_size,
-                streaming_window_size=args.streaming_window_size,
-                streaming_full_draft_heads=selected_streaming_heads,
-                draft_attn_debug=args.draft_attn_debug,
-                h2o_kv_prune=args.h2o_kv_prune,
-                h2o_heavy_budget=args.h2o_heavy_budget,
-                h2o_recent_budget=args.h2o_recent_budget,
-                log=True
+                log=True,
             )
             torch.cuda.synchronize()
             total_time = time.time() - start_time
-            output_ids = output_ids[0][len(input_ids[0]):]
-            # be consistent with the template's stop_token_ids
+            output_ids = output_ids[0][len(input_ids[0]) :]
+
             if conv.stop_token_ids:
                 stop_token_ids_index = [
-                    i
-                    for i, id in enumerate(output_ids)
-                    if id in conv.stop_token_ids
+                    i for i, id in enumerate(output_ids) if id in conv.stop_token_ids
                 ]
                 if len(stop_token_ids_index) > 0:
                     output_ids = output_ids[: stop_token_ids_index[0]]
@@ -439,15 +280,9 @@ def get_model_answers(
             new_tokens.append(int(new_token))
             wall_time.append(total_time)
             conv.messages[-1][-1] = output
-    print('Warmup done')
-    if args.record_linear_time:
-        _reset_linear_timing_stats(model)
+    print("Warmup done")
 
-    # questions=questions[6:]
     for question in tqdm(questions):
-        if args.record_linear_time:
-            _reset_linear_timing_stats(model)
-
         choices = []
         for i in range(num_choices):
             torch.manual_seed(i)
@@ -456,7 +291,6 @@ def get_model_answers(
             idxs = []
             new_tokens = []
             wall_time = []
-            prefill_times = []
             for j in range(len(question["turns"])):
                 qs = question["turns"][j]
                 conv.append_message(conv.roles[0], qs)
@@ -465,33 +299,23 @@ def get_model_answers(
                 input_ids = tokenizer([prompt]).input_ids
                 input_ids = truncate_input_ids(input_ids, args.max_input_tokens)
 
-
                 torch.cuda.synchronize()
                 start_time = time.time()
-                output_ids, new_token, idx, sample_prefill_time = model.eagenerate(
+                output_ids, new_token, idx = model.naivegenerate(
                     torch.as_tensor(input_ids).cuda(),
                     temperature=temperature,
                     max_length=args.max_length,
                     max_new_tokens=max_new_token,
-                    streaming_kv_prune=args.streaming_kv_prune,
-                    streaming_sink_size=args.streaming_sink_size,
-                    streaming_window_size=args.streaming_window_size,
-                    streaming_full_draft_heads=selected_streaming_heads,
-                    draft_attn_debug=args.draft_attn_debug,
-                    h2o_kv_prune=args.h2o_kv_prune,
-                    h2o_heavy_budget=args.h2o_heavy_budget,
-                    h2o_recent_budget=args.h2o_recent_budget,
-                    log=True
+                    log=True,
+                    attn_debug=args.attn_debug,
                 )
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
-                output_ids = output_ids[0][len(input_ids[0]):]
+                output_ids = output_ids[0][len(input_ids[0]) :]
 
                 if conv.stop_token_ids:
                     stop_token_ids_index = [
-                        i
-                        for i, id in enumerate(output_ids)
-                        if id in conv.stop_token_ids
+                        i for i, id in enumerate(output_ids) if id in conv.stop_token_ids
                     ]
                     if len(stop_token_ids_index) > 0:
                         output_ids = output_ids[: stop_token_ids_index[0]]
@@ -525,8 +349,8 @@ def get_model_answers(
                         generated_text=output,
                         generated_token_ids=output_ids.tolist(),
                     )
-                if args.draft_attn_debug:
-                    _save_draft_attn_debug_snapshot(
+                if args.attn_debug:
+                    _save_attn_debug_snapshot(
                         model=model,
                         args=args,
                         question_id=question["question_id"],
@@ -542,14 +366,18 @@ def get_model_answers(
                 idxs.append(int(idx))
                 new_tokens.append(int(new_token))
                 wall_time.append(total_time)
-                prefill_times.append(sample_prefill_time)
                 conv.messages[-1][-1] = output
-            # torch.cuda.empty_cache()
-            choices.append({"index": i, "turns": turns, "idxs": idxs, "new_tokens": new_tokens, "wall_time": wall_time, "prefill_time": prefill_times})
 
-        sample_linear_timing = _collect_linear_timing_summary(model, args.record_linear_time)
+            choices.append(
+                {
+                    "index": i,
+                    "turns": turns,
+                    "idxs": idxs,
+                    "new_tokens": new_tokens,
+                    "wall_time": wall_time,
+                }
+            )
 
-        # Dump answers
         os.makedirs(os.path.dirname(answer_file), exist_ok=True)
         with open(os.path.expanduser(answer_file), "a") as fout:
             ans_json = {
@@ -557,14 +385,13 @@ def get_model_answers(
                 "answer_id": shortuuid.uuid(),
                 "model_id": model_id,
                 "choices": choices,
-                "linear_timing": sample_linear_timing,
                 "tstamp": time.time(),
             }
             fout.write(json.dumps(ans_json) + "\n")
 
 
 def reorg_answer_file(answer_file):
-    """Sort by question id and de-duplication"""
+    """Sort by question id and de-duplication."""
     answers = {}
     with open(answer_file, "r") as fin:
         for l in fin:
@@ -582,20 +409,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ea-model-path",
         type=str,
-        default="/workspace/yunhai/Qwen3-4B_eagle3",
-        help="The path to the weights. This can be a local folder or a Hugging Face repo ID.",
+        default="AngelSlim/Qwen3-1.7B_eagle3",
+        help="Path to EAGLE weights. Required by EaModel wrapper.",
     )
-    parser.add_argument("--base-model-path", type=str, default="Qwen/Qwen3-4B",
-                        help="1")
+    parser.add_argument(
+        "--base-model-path",
+        type=str,
+        default="Qwen/Qwen3-1.7B",
+        help="Base model path or HF model id.",
+    )
     parser.add_argument(
         "--load-in-8bit", action="store_false", help="Use 8-bit quantization"
     )
-    parser.add_argument(
-        "--model-id",
-        type=str,
-        default="auto",
-        help="Output model id in jsonl. Use 'auto' to derive from base/draft paths.",
-    )
+    parser.add_argument("--model-id", type=str, default="qwen3-1.7b-baseline")
     parser.add_argument(
         "--bench-name",
         type=str,
@@ -621,13 +447,13 @@ if __name__ == "__main__":
         "--total-token",
         type=int,
         default=32,
-        help="The maximum number of new generated tokens.",
+        help="Needed by EaModel wrapper; not used by naive AR generation quality.",
     )
     parser.add_argument(
         "--max-length",
         type=int,
         default=8192,
-        help="Maximum total sequence length used by eagenerate.",
+        help="Maximum total sequence length used by naivegenerate.",
     )
     parser.add_argument(
         "--max-input-tokens",
@@ -636,57 +462,16 @@ if __name__ == "__main__":
         help="If prompt token length exceeds this value, keep head and tail halves only.",
     )
     parser.add_argument(
-        "--streaming-kv-prune",
-        action="store_true",
-        help="Enable StreamingLLM-style KV pruning after prefill.",
-    )
-    parser.add_argument(
-        "--streaming-sink-size",
-        type=int,
-        default=4,
-        help="Number of sink tokens kept from sequence start when pruning KV.",
-    )
-    parser.add_argument(
-        "--streaming-window-size",
-        type=int,
-        default=2044,
-        help="Number of most recent tokens kept when pruning KV. With default sink=4, total kept tokens=2048.",
-    )
-    parser.add_argument(
-        "--streaming-full-draft-heads",
-        type=str,
-        default="",
-        help="[Deprecated alias] Use --streaming-protected-draft-heads. Comma-separated draft head ids kept full (protected) during streaming prune.",
-    )
-    parser.add_argument(
-        "--streaming-protected-draft-heads",
-        type=str,
-        default="",
-        help="Preferred name. Comma-separated draft head ids protected from streaming prune (global-like heads), e.g. '2,3,9'.",
-    )
-    parser.add_argument(
-        "--streaming-random-draft-head-count",
-        type=int,
-        default=0,
-        help="If > 0, randomly select this many protected draft heads (global-like) during streaming prune.",
-    )
-    parser.add_argument(
-        "--streaming-random-seed",
-        type=int,
-        default=0,
-        help="Random seed used when selecting random draft heads.",
-    )
-    parser.add_argument(
         "--depth",
         type=int,
         default=8,
-        help="The maximum number of new generated tokens.",
+        help="Needed by EaModel wrapper.",
     )
     parser.add_argument(
         "--top-k",
         type=int,
         default=4,
-        help="The maximum number of new generated tokens.",
+        help="Needed by EaModel wrapper.",
     )
     parser.add_argument(
         "--num-choices",
@@ -706,24 +491,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-gpu-memory",
         type=str,
-        help="Maxmum GPU memory used for model weights per GPU.",
+        help="Maximum GPU memory used for model weights per GPU.",
     )
-
     parser.add_argument(
         "--temperature",
         type=float,
-        default=1.0,
+        default=0.0,
     )
-
     parser.add_argument(
         "--tree-choices",
         type=str,
         default="mc_sim_7b_63",
     )
-
     parser.add_argument(
         "--use-eagle3",
-        action="store_true"
+        action="store_true",
     )
     parser.add_argument(
         "--kv-debug",
@@ -737,57 +519,22 @@ if __name__ == "__main__":
         help="Directory to save KV debug snapshots.",
     )
     parser.add_argument(
-        "--draft-attn-debug",
+        "--attn-debug",
         action="store_true",
-        help="Save draft-model attention traces aligned to accepted tokens.",
+        help="Save per-step accepted-token attention scores to previous tokens.",
     )
     parser.add_argument(
-        "--draft-attn-debug-dir",
+        "--attn-debug-dir",
         type=str,
-        default=f"{parent_dir}/outputs/draft_attn_debug",
-        help="Directory to save draft attention debug snapshots.",
-    )
-    parser.add_argument(
-        "--h2o-kv-prune",
-        action="store_true",
-        help="Enable H2O KV pruning on the draft model (heavy-hitter + recent window).",
-    )
-    parser.add_argument(
-        "--h2o-heavy-budget",
-        type=int,
-        default=200,
-        help="Number of heavy-hitter tokens to keep when H2O pruning is active.",
-    )
-    parser.add_argument(
-        "--h2o-recent-budget",
-        type=int,
-        default=2000,
-        help="Number of most-recent tokens to keep when H2O pruning is active.",
-    )
-    parser.add_argument(
-        "--record-linear-time",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Record qkv/other linear projection timing and write per-sample stats into output jsonl.",
+        default=f"{parent_dir}/outputs/attn_debug",
+        help="Directory to save attention debug snapshots.",
     )
 
     args = parser.parse_args()
-    old_heads = parse_head_list(args.streaming_full_draft_heads)
-    new_heads = parse_head_list(args.streaming_protected_draft_heads)
-    # Prefer the clearer protected-head name when both are provided.
-    args.streaming_protected_draft_heads = new_heads if new_heads is not None else old_heads
-    # Keep legacy field for backward compatibility in downstream calls.
-    args.streaming_full_draft_heads = args.streaming_protected_draft_heads
 
-    for k,v in vars(args).items():
+    for k, v in vars(args).items():
         print(f"{k}={v}")
 
-    if str(args.model_id).lower() == "auto":
-        base_name = os.path.basename(str(args.base_model_path).rstrip("/"))
-        if not base_name:
-            base_name = "base-model"
-        suffix = "eagle3" if args.use_eagle3 else "eagle"
-        args.model_id = f"{base_name}-{suffix}"
     args.model_id = args.model_id + "-temperature-" + str(args.temperature)
     if args.num_gpus_total // args.num_gpus_per_model > 1:
         import ray
@@ -816,7 +563,7 @@ if __name__ == "__main__":
         args.num_gpus_total,
         args.max_gpu_memory,
         args.temperature,
-        args
+        args,
     )
 
     reorg_answer_file(answer_file)

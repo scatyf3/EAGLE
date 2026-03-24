@@ -20,6 +20,8 @@
 """ PyTorch LLaMA model."""
 import copy
 import os
+import time
+import weakref
 # os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 import math
 from typing import List, Optional, Tuple, Union
@@ -40,6 +42,48 @@ except:
     from utils_c import *
     from choices import *
     from utils import prepare_logits_processor
+
+
+def _is_truthy(value):
+    if value is None:
+        return False
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def _ensure_linear_timing_state(owner):
+    if owner is None:
+        return
+    if not hasattr(owner, "_linear_timing_stats"):
+        owner._linear_timing_stats = {
+            "self_attn_s": 0.0,
+            "other_linear_s": 0.0,
+        }
+    if not hasattr(owner, "_linear_timing_counts"):
+        owner._linear_timing_counts = {
+            "self_attn_ops": 0,
+            "other_linear_ops": 0,
+        }
+    if not hasattr(owner, "_linear_timing_step"):
+        owner._linear_timing_step = 0
+
+
+def _linear_timer_start(tensor, enabled):
+    if not enabled:
+        return None
+    if tensor.is_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize(tensor.device)
+    return time.perf_counter()
+
+
+def _linear_timer_end(owner, time_key, count_key, start_time, op_count, tensor_for_sync):
+    if owner is None or start_time is None:
+        return
+    _ensure_linear_timing_state(owner)
+    if tensor_for_sync.is_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize(tensor_for_sync.device)
+    elapsed = time.perf_counter() - start_time
+    owner._linear_timing_stats[time_key] += float(elapsed)
+    owner._linear_timing_counts[count_key] += int(op_count)
 
 
 
@@ -249,7 +293,12 @@ class LlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
+        owner_ref = getattr(self, "_timing_owner_ref", None)
+        owner = owner_ref() if owner_ref is not None else None
+        enable_timing = owner is not None and getattr(owner, "_record_linear_time", False)
+
         if self.config.pretraining_tp > 1:
+            qkv_op_count = int(3 * self.config.pretraining_tp)
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
                 (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
@@ -257,6 +306,7 @@ class LlamaAttention(nn.Module):
             key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
             value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
 
+            timer = _linear_timer_start(hidden_states, enable_timing)
             query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
             query_states = torch.cat(query_states, dim=-1)
 
@@ -265,11 +315,14 @@ class LlamaAttention(nn.Module):
 
             value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
             value_states = torch.cat(value_states, dim=-1)
+            _linear_timer_end(owner, "other_linear_s", "other_linear_ops", timer, qkv_op_count, value_states)
 
         else:
+            timer = _linear_timer_start(hidden_states, enable_timing)
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
+            _linear_timer_end(owner, "other_linear_s", "other_linear_ops", timer, 3, value_states)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -281,6 +334,7 @@ class LlamaAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
+        timer_attn = _linear_timer_start(query_states, enable_timing)
         if past_key_value is not None:
             # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -291,7 +345,6 @@ class LlamaAttention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -310,6 +363,7 @@ class LlamaAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
+        _linear_timer_end(owner, "self_attn_s", "self_attn_ops", timer_attn, 1, attn_output)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -323,9 +377,20 @@ class LlamaAttention(nn.Module):
         if self.config.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+            timer = _linear_timer_start(attn_output[0], enable_timing)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+            _linear_timer_end(
+                owner,
+                "other_linear_s",
+                "other_linear_ops",
+                timer,
+                int(self.config.pretraining_tp),
+                attn_output,
+            )
         else:
+            timer = _linear_timer_start(attn_output, enable_timing)
             attn_output = self.o_proj(attn_output)
+            _linear_timer_end(owner, "other_linear_s", "other_linear_ops", timer, 1, attn_output)
 
         if not output_attentions:
             attn_weights = None
@@ -345,24 +410,54 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        owner_ref = getattr(self, "_timing_owner_ref", None)
+        owner = owner_ref() if owner_ref is not None else None
+        enable_timing = owner is not None and getattr(owner, "_record_linear_time", False)
+
         if self.config.pretraining_tp > 1:
             slice = self.intermediate_size // self.config.pretraining_tp
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
             up_proj_slices = self.up_proj.weight.split(slice, dim=0)
             down_proj_slices = self.down_proj.weight.split(slice, dim=1)
 
+            timer = _linear_timer_start(x, enable_timing)
             gate_proj = torch.cat(
                 [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
             )
             up_proj = torch.cat([F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
+            _linear_timer_end(
+                owner,
+                "other_linear_s",
+                "other_linear_ops",
+                timer,
+                int(2 * self.config.pretraining_tp),
+                up_proj,
+            )
 
             intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
+            timer = _linear_timer_start(intermediate_states[0], enable_timing)
             down_proj = [
                 F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
             ]
             down_proj = sum(down_proj)
+            _linear_timer_end(
+                owner,
+                "other_linear_s",
+                "other_linear_ops",
+                timer,
+                int(self.config.pretraining_tp),
+                down_proj,
+            )
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            timer = _linear_timer_start(x, enable_timing)
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            _linear_timer_end(owner, "other_linear_s", "other_linear_ops", timer, 2, up)
+
+            intermediate = self.act_fn(gate) * up
+            timer = _linear_timer_start(intermediate, enable_timing)
+            down_proj = self.down_proj(intermediate)
+            _linear_timer_end(owner, "other_linear_s", "other_linear_ops", timer, 1, down_proj)
 
         return down_proj
 
@@ -479,6 +574,8 @@ class Model(nn.Module):
     def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0):
         super().__init__()
         self.config=config
+        self._record_linear_time = False
+        self.reset_linear_timing_stats()
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -534,6 +631,8 @@ class Model(nn.Module):
             self.fc = nn.Linear(config.hidden_size * 3, self.hidden_size, bias=False)
         self.norm=LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.logsoftmax = nn.LogSoftmax(dim=-1)
+        self.midlayer.self_attn._timing_owner_ref = weakref.ref(self)
+        self.midlayer.mlp._timing_owner_ref = weakref.ref(self)
 
         d2t=torch.zeros((config.draft_vocab_size),dtype=torch.long)
         t2d=torch.zeros((config.vocab_size),dtype=torch.bool)
@@ -542,6 +641,24 @@ class Model(nn.Module):
 
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
+
+    def reset_linear_timing_stats(self):
+        _ensure_linear_timing_state(self)
+        self._linear_timing_stats["self_attn_s"] = 0.0
+        self._linear_timing_stats["other_linear_s"] = 0.0
+        self._linear_timing_counts["self_attn_ops"] = 0
+        self._linear_timing_counts["other_linear_ops"] = 0
+        self._linear_timing_step = 0
+
+    def get_linear_timing_stats(self):
+        _ensure_linear_timing_state(self)
+        return {
+            "self_attn_s": float(self._linear_timing_stats["self_attn_s"]),
+            "other_linear_s": float(self._linear_timing_stats["other_linear_s"]),
+            "self_attn_ops": int(self._linear_timing_counts["self_attn_ops"]),
+            "other_linear_ops": int(self._linear_timing_counts["other_linear_ops"]),
+            "steps": int(self._linear_timing_step),
+        }
 
     def init_tree(self):
         self.tree_mask_init = torch.eye(self.top_k, device=self.embed_tokens.weight.device)[None, None]
@@ -597,6 +714,7 @@ class Model(nn.Module):
             return_dict: Optional[bool] = None,
             std=None
     ):
+        self._record_linear_time = _is_truthy(os.getenv("EAGLE_RECORD_LINEAR_TIME", "0"))
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
@@ -637,7 +755,9 @@ class Model(nn.Module):
         # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
         if hidden_states.shape[-1]!=inputs_embeds.shape[-1]:
+            timer = _linear_timer_start(hidden_states, self._record_linear_time)
             hidden_states = self.fc(hidden_states)
+            _linear_timer_end(self, "other_linear_s", "other_linear_ops", timer, 1, hidden_states)
         # hidden_states = self.fc(hidden_states)
 
         all_hidden_states = () if output_hidden_states else None
@@ -653,13 +773,23 @@ class Model(nn.Module):
             output_attentions=output_attentions,
             use_cache=True,
         )
+        self_attn_weights = layer_outputs[1] if output_attentions else None
         if use_cache:
             next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
         hidden_states = layer_outputs[0]
 
 
         if use_cache:
+            if output_attentions:
+                if self._record_linear_time:
+                    self._linear_timing_step += 1
+                return hidden_states, next_decoder_cache, self_attn_weights
+            if self._record_linear_time:
+                self._linear_timing_step += 1
             return hidden_states, next_decoder_cache
+
+        if self._record_linear_time:
+            self._linear_timing_step += 1
 
         return hidden_states
 
@@ -667,7 +797,7 @@ class Model(nn.Module):
         self.stable_kv = None
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, draft_attn_debug=False, h2o_collect_attn=False):
 
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
@@ -685,19 +815,62 @@ class Model(nn.Module):
 
         len_posi = input_ids.shape[1]
         self.reset()
+        self.last_topk_draft_attn_trace = None
+        self.last_h2o_attn_weights = None
+        draft_attn_trace = [] if draft_attn_debug else None
+        need_attn = draft_attn_debug or h2o_collect_attn
 
         # with Timer("draft many"):
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
-                                               past_key_values=self.stable_kv, use_cache=True)
+            fresh_input_ids = input_ids[:, kv_len:]
+            # If external KV pruning shortens stable_kv only, kv_len no longer matches
+            # the hidden_states span. Fall back to the latest aligned suffix.
+            if fresh_input_ids.shape[1] != hidden_states.shape[1]:
+                fresh_input_ids = input_ids[:, -hidden_states.shape[1]:]
+            if need_attn:
+                out_hidden, past_key_values, attn_weights = self(
+                    hidden_states,
+                    input_ids=fresh_input_ids,
+                    past_key_values=self.stable_kv,
+                    use_cache=True,
+                    output_attentions=True,
+                )
+            else:
+                out_hidden, past_key_values = self(hidden_states, input_ids=fresh_input_ids,
+                                                   past_key_values=self.stable_kv, use_cache=True)
         else:
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+            if need_attn:
+                out_hidden, past_key_values, attn_weights = self(
+                    hidden_states,
+                    input_ids=input_ids,
+                    use_cache=True,
+                    output_attentions=True,
+                )
+            else:
+                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+
+        if draft_attn_debug:
+            last_attn = attn_weights[0, :, -1, :]
+            prev_attn = last_attn[:, :-1].detach().cpu() if last_attn.shape[-1] > 1 else last_attn[:, :0].detach().cpu()
+            draft_attn_trace.append(
+                {
+                    "draft_step": 0,
+                    "attn_to_previous_tokens": prev_attn,
+                    "kv_len": int(last_attn.shape[-1]),
+                }
+            )
+        if h2o_collect_attn:
+            # Store full attention weights for H2O score accumulation: [num_heads, q_len, kv_len]
+            self.last_h2o_attn_weights = attn_weights[0].detach()
+
         self.stable_kv = past_key_values
         last_hidden = out_hidden[:, -1]
 
         # last_headout = head(last_hidden)
+        timer = _linear_timer_start(last_hidden, self._record_linear_time)
         last_headout = self.lm_head(self.norm(last_hidden))
+        _linear_timer_end(self, "other_linear_s", "other_linear_ops", timer, 1, last_headout)
 
         last_p = self.logsoftmax(last_headout)
         top = torch.topk(last_p, top_k, dim=-1)
@@ -720,9 +893,30 @@ class Model(nn.Module):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
             # with Timer("draft one"):
-            out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
-                                               position_ids=position_ids, use_cache=True)
+            if draft_attn_debug:
+                out_hidden, past_key_values, attn_weights = self(
+                    input_hidden,
+                    input_ids=input_ids,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                    use_cache=True,
+                    output_attentions=True,
+                )
+            else:
+                out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+                                                   position_ids=position_ids, use_cache=True)
             len_posi += 1
+
+            if draft_attn_debug:
+                last_attn = attn_weights[0, :, -1, :]
+                prev_attn = last_attn[:, :-1].detach().cpu() if last_attn.shape[-1] > 1 else last_attn[:, :0].detach().cpu()
+                draft_attn_trace.append(
+                    {
+                        "draft_step": int(i + 1),
+                        "attn_to_previous_tokens": prev_attn,
+                        "kv_len": int(last_attn.shape[-1]),
+                    }
+                )
 
             # with Timer("sort1"):
             bias1 = top_k if i > 0 else 0
@@ -731,7 +925,9 @@ class Model(nn.Module):
             parents = (topk_cs_index + bias)
             parents_list.append(parents)
 
+            timer = _linear_timer_start(out_hidden[0], self._record_linear_time)
             last_headout = self.lm_head(self.norm(out_hidden[0]))
+            _linear_timer_end(self, "other_linear_s", "other_linear_ops", timer, 1, last_headout)
             last_p = self.logsoftmax(last_headout)
 
             top = torch.topk(last_p, top_k, dim=-1)
@@ -823,6 +1019,9 @@ class Model(nn.Module):
         retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
+
+        if draft_attn_debug:
+            self.last_topk_draft_attn_trace = draft_attn_trace
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 

@@ -4,7 +4,6 @@ import random
 # typing 
 from typing import List, Tuple
 import time
-from flask import logging
 import torch
 
 # TODO
@@ -207,7 +206,7 @@ def generate_tree_buffers(tree_choices, device="cuda"):
 
     return tree_buffers
 
-# 好像是弃用了
+
 def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     draft_tokens, retrieve_indices,tree_mask,tree_position_ids, outputs, logits, hidden_state, sample_token = model(
         input_ids, past_key_values=past_key_values, output_orig=True, logits_processor=logits_processor
@@ -230,43 +229,35 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
-def initialize_tree(input_ids, model, past_key_values, logits_processor):
-    '''
-    先target model prefill，然后draft model生成一轮，生成最初始化的tree
-    '''
-    logging.info("Initializing tree buffers by forwarding through the target model...")
-
-    logging.info(f"target model forwarding")
+def initialize_tree(input_ids, model, past_key_values, logits_processor, draft_attn_debug=False, h2o_collect_attn=False):
     outputs, orig, hidden_states = model(
         input_ids, past_key_values=past_key_values, output_orig=True
     )
 
     if logits_processor is not None:
-        logging.info("Using sampling decoding for tree initialization token.")
         logits = orig[:, -1]
         logits = logits_processor(None, logits)
         probabilities = torch.nn.functional.softmax(logits, dim=1)
         token = torch.multinomial(probabilities, 1)
     else:
-        logging.info("Using greedy decoding for tree initialization token.")
         token = torch.argmax(orig[:, -1])
         token = token[None, None]
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
 
     # Clone the output hidden states
     if model.use_eagle3:
-        logging.info("Using EAGLE3 model for tree initialization, where hidden states are concatenated.")
-        ea_device = model.ea_layer.lm_head.weight.device # a device checker
+        ea_device = model.ea_layer.lm_head.weight.device
         if outputs["hidden_states"][0].device != ea_device:
             outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
-        for i, h in enumerate(outputs["hidden_states"]):
-            logging.info(f"Layer {i} hidden_state shape: {h.shape}")
-            logging.info(f"Layer {i} first 3 elements: {h[0, -1, :3].tolist()}")
         hidden_states=torch.cat(outputs["hidden_states"],dim=-1)
-        logging.info(f"Concatenated hidden_states shape: {hidden_states.shape}")
-        logging.info(f"Concatenated sample elements: {hidden_states[0, -1, :5]}")
-    logging.info("Generating draft tokens and retrieve indices using the EA layer...")
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(
+        hidden_states,
+        input_ids,
+        model.base_model.lm_head,
+        logits_processor,
+        draft_attn_debug=draft_attn_debug,
+        h2o_collect_attn=h2o_collect_attn,
+    )
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
 
 
@@ -327,44 +318,23 @@ def tree_decoding(
         input_ids,
         retrieve_indices,
 ):
-    '''
-    这部分比较抽象，推荐打印下output
-    '''
-
-    logging.info("Params for tree decoding:")
-    logging.info(f"tree_candidates shape: {tree_candidates.shape}")
-    logging.info(f"past_key_values length: {len(past_key_values)}")
-    logging.info(f"tree_position_ids shape: {tree_position_ids.shape}")
-    logging.info(f"input_ids shape: {input_ids.shape}")
-    logging.info(f"retrieve_indices shape: {retrieve_indices.shape}")
     position_ids = tree_position_ids + input_ids.shape[1]
-    logging.info(f"Tree position ids: {position_ids}")
     if position_ids is not None and position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
-    logging.info("Forwarding through the model for tree decoding...")
     outputs, tree_logits, hidden_state = model(
         tree_candidates,
         output_orig=True,
         past_key_values=past_key_values,
         position_ids=position_ids,
     )
-    
+
     if model.use_eagle3:
-        logging.info("Using EAGLE3 model for tree initialization, where hidden states are concatenated.")
-        ea_device = model.ea_layer.lm_head.weight.device # a device checker
+        ea_device = model.ea_layer.lm_head.weight.device
         if outputs["hidden_states"][0].device != ea_device:
             outputs["hidden_states"] = [x.to(ea_device) for x in outputs["hidden_states"]]
-        for i, h in enumerate(outputs["hidden_states"]):
-            logging.info(f"Layer {i} hidden_state shape: {h.shape}")
-            logging.info(f"Layer {i} first 3 elements: {h[0, -1, :3].tolist()}")
-        hidden_states=torch.cat(outputs["hidden_states"],dim=-1)
-        logging.info(f"Concatenated hidden_states shape: {hidden_states.shape}")
-        logging.info(f"Concatenated sample elements: {hidden_states[0, -1, :5]}")
-    logging.info("Extracting logits for the retrieve indices...")
+        hidden_state = torch.cat(outputs["hidden_states"], dim=-1)
+
     logits = tree_logits[0, retrieve_indices]
-    logging.info(f"Logits shape after retrieve indices: {logits.shape}")
-    logging.info(f"hidden_state shape: {hidden_state.shape}")
-    logging.info(f"outputs keys: {outputs.keys()}")
     return logits, hidden_state, outputs
 
 
@@ -395,7 +365,6 @@ def evaluate_posterior(
     """
     # Greedy decoding based on temperature value
     if logits_processor is None:
-        logging.info("Using greedy decoding for candidate evaluation.")
         # Find the tokens that match the maximum logits for each position in the sequence
         posterior_mask = (
                 candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
@@ -411,7 +380,6 @@ def evaluate_posterior(
         return best_candidate, accept_length, logits[best_candidate, accept_length]
 
     else:
-        logging.info("Using posterior probability evaluation for candidate selection.")
         accept_length = 1
         accept_cand = candidates[0][:1]
         best_candidate = 0
@@ -467,19 +435,19 @@ def update_inference_inputs(
         current_length_data,
         model,
         hidden_state_new,
-        sample_p
+        sample_p,
+        draft_attn_debug=False,
+        h2o_collect_attn=False,
 ):
-    '''
-    根据上一轮的验证结果，从复杂的“树状 KV Cache”中精准提取出正确的线性路径，并将模型状态重置，以开启下一轮的投机预测
-    '''
     prev_input_len = input_ids.shape[1]
     # Map the best candidate indices to the original indices in the sequence
     select_indices = (
             retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
     )
     # Append the tokens from the best candidate to the input sequence
+    accepted_tokens = candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)
     input_ids = torch.cat(
-        [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
+        [input_ids, accepted_tokens], dim=-1
     )
     # Update the past key values based on the selected tokens
     # Source tensor that contains relevant past information based on the selected candidate
@@ -504,10 +472,22 @@ def update_inference_inputs(
     else:
         token = torch.argmax(prob)
         token = token[None, None]
+
+    if hasattr(model, "draft_input_ids") and model.draft_input_ids is not None:
+        model.draft_input_ids = torch.cat((model.draft_input_ids, accepted_tokens), dim=1)
+        draft_context_input_ids = model.draft_input_ids
+    else:
+        draft_context_input_ids = input_ids
+
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
-                                              input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
-                                              head=model.base_model.lm_head,logits_processor=logits_processor)
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(
+        accept_hidden_state_new,
+        input_ids=torch.cat((draft_context_input_ids, token.to(input_ids.device)), dim=1),
+        head=model.base_model.lm_head,
+        logits_processor=logits_processor,
+        draft_attn_debug=draft_attn_debug,
+        h2o_collect_attn=h2o_collect_attn,
+    )
 
 
     new_token += accept_length + 1

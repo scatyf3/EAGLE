@@ -19,7 +19,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional, Union, Tuple
+import os
+import time
+import weakref
+from typing import Callable, Dict, Optional, Union, Tuple
 
 import torch
 from torch import nn
@@ -28,9 +31,20 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+try:
+    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+except ImportError:
+    create_causal_mask = None
+    create_sliding_window_causal_mask = None
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import GradientCheckpointingLayer
+try:
+    from transformers.modeling_layers import GradientCheckpointingLayer
+except ImportError:
+    class GradientCheckpointingLayer(nn.Module):
+        """Compatibility fallback for transformers versions without modeling_layers."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__()
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -41,11 +55,87 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
+try:
+    from transformers.utils import auto_docstring, can_return_tuple, logging
+except ImportError:
+    from transformers.utils import logging
+
+    def auto_docstring(*args, **kwargs):
+        if args and callable(args[0]) and len(args) == 1 and not kwargs:
+            return args[0]
+
+        def decorator(obj):
+            return obj
+
+        return decorator
+
+    def can_return_tuple(fn):
+        return fn
+try:
+    from transformers.utils import LossKwargs
+except ImportError:
+    from typing_extensions import TypedDict
+
+    class LossKwargs(TypedDict, total=False):
+        """Fallback TypedDict for transformers versions without LossKwargs."""
+
+        pass
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 
 logger = logging.get_logger(__name__)
+
+_LINEAR_TIMING_ENV = "EAGLE_RECORD_LINEAR_TIME"
+_LINEAR_TIMING_PRINT_EVERY_ENV = "EAGLE_RECORD_LINEAR_TIME_PRINT_EVERY"
+
+
+def _is_truthy(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _ensure_linear_timing_state(owner: Optional[nn.Module]) -> None:
+    if owner is None:
+        return
+    if not hasattr(owner, "_linear_timing_stats"):
+        owner._linear_timing_stats = {
+            "self_attn_s": 0.0,
+            "other_linear_s": 0.0,
+        }
+    if not hasattr(owner, "_linear_timing_counts"):
+        owner._linear_timing_counts = {
+            "self_attn_ops": 0,
+            "other_linear_ops": 0,
+        }
+    if not hasattr(owner, "_linear_timing_step"):
+        owner._linear_timing_step = 0
+
+
+def _linear_timer_start(tensor: torch.Tensor, enabled: bool) -> Optional[float]:
+    if not enabled:
+        return None
+    if tensor.is_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize(tensor.device)
+    return time.perf_counter()
+
+
+def _linear_timer_end(
+    owner: Optional[nn.Module],
+    time_key: str,
+    count_key: str,
+    start_time: Optional[float],
+    op_count: int,
+    tensor_for_sync: torch.Tensor,
+) -> None:
+    if owner is None or start_time is None:
+        return
+    _ensure_linear_timing_state(owner)
+    if tensor_for_sync.is_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize(tensor_for_sync.device)
+    elapsed = time.perf_counter() - start_time
+    owner._linear_timing_stats[time_key] += float(elapsed)
+    owner._linear_timing_counts[count_key] += int(op_count)
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -112,6 +202,50 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     )
 
 
+if create_causal_mask is None:
+    def create_causal_mask(
+        config=None,
+        input_embeds: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        cache_position: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[torch.Tensor, ...]] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        if attention_mask is not None and attention_mask.dim() == 4:
+            return attention_mask
+
+        if input_embeds is None:
+            raise ValueError("input_embeds must be provided for legacy causal mask fallback")
+
+        batch_size, seq_len = input_embeds.shape[:2]
+        past_key_values_length = 0
+        if past_key_values is not None:
+            try:
+                past_key_values_length = int(past_key_values[0][0].shape[2])
+            except Exception:
+                past_key_values_length = 0
+
+        base_mask = _make_causal_mask(
+            (batch_size, seq_len),
+            torch.float32,
+            device=input_embeds.device,
+            past_key_values_length=past_key_values_length,
+        )
+
+        if attention_mask is None:
+            return base_mask
+
+        expanded = _expand_mask(attention_mask, input_embeds.dtype, tgt_len=seq_len).to(input_embeds.device)
+        return expanded + base_mask
+
+
+if create_sliding_window_causal_mask is None:
+    def create_sliding_window_causal_mask(**kwargs):
+        # Older transformers versions have no dedicated sliding-window helper.
+        return create_causal_mask(**kwargs)
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -145,7 +279,19 @@ class Qwen3MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        owner_ref = getattr(self, "_timing_owner_ref", None)
+        owner = owner_ref() if owner_ref is not None else None
+        enable_timing = owner is not None and getattr(owner, "_record_linear_time", False)
+
+        timer = _linear_timer_start(x, enable_timing)
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        _linear_timer_end(owner, "other_linear_s", "other_linear_ops", timer, 2, up)
+
+        intermediate = self.act_fn(gate) * up
+        timer = _linear_timer_start(intermediate, enable_timing)
+        down_proj = self.down_proj(intermediate)
+        _linear_timer_end(owner, "other_linear_s", "other_linear_ops", timer, 1, down_proj)
         return down_proj
 
 
@@ -248,7 +394,11 @@ class Qwen3Attention(nn.Module):
         )
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None or layer_idx >= len(layer_types):
+            self.sliding_window = None
+        else:
+            self.sliding_window = getattr(config, "sliding_window", None) if layer_types[layer_idx] == "sliding_attention" else None
 
     def forward(
         self,
@@ -262,13 +412,20 @@ class Qwen3Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        owner_ref = getattr(self, "_timing_owner_ref", None)
+        owner = owner_ref() if owner_ref is not None else None
+        enable_timing = owner is not None and getattr(owner, "_record_linear_time", False)
+
+        timer = _linear_timer_start(hidden_states, enable_timing)
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        _linear_timer_end(owner, "other_linear_s", "other_linear_ops", timer, 3, value_states)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        timer_attn = _linear_timer_start(query_states, enable_timing)
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -280,7 +437,6 @@ class Qwen3Attention(nn.Module):
         attention_interface: Callable = eager_attention_forward
         # if self.config._attn_implementation != "eager":
         #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -292,9 +448,12 @@ class Qwen3Attention(nn.Module):
             sliding_window=self.sliding_window,  # diff with Llama
             **kwargs,
         )
+        _linear_timer_end(owner, "self_attn_s", "self_attn_ops", timer_attn, 1, attn_output)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        timer = _linear_timer_start(attn_output, enable_timing)
         attn_output = self.o_proj(attn_output)
+        _linear_timer_end(owner, "other_linear_s", "other_linear_ops", timer, 1, attn_output)
         return attn_output, attn_weights, past_key_value
 
 
@@ -308,7 +467,11 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attention_type = config.layer_types[layer_idx]
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None or layer_idx >= len(layer_types):
+            self.attention_type = "full_attention"
+        else:
+            self.attention_type = layer_types[layer_idx]
 
     def forward(
         self,
@@ -431,10 +594,55 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+        self.has_sliding_layers = "sliding_attention" in getattr(self.config, "layer_types", [])
+        self._record_linear_time = False
+        self.reset_linear_timing_stats()
+        for layer in self.layers:
+            layer.self_attn._timing_owner_ref = weakref.ref(self)
+            layer.mlp._timing_owner_ref = weakref.ref(self)
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def reset_linear_timing_stats(self):
+        _ensure_linear_timing_state(self)
+        self._linear_timing_stats["self_attn_s"] = 0.0
+        self._linear_timing_stats["other_linear_s"] = 0.0
+        self._linear_timing_counts["self_attn_ops"] = 0
+        self._linear_timing_counts["other_linear_ops"] = 0
+        self._linear_timing_step = 0
+
+    def get_linear_timing_stats(self) -> Dict[str, Union[int, float]]:
+        _ensure_linear_timing_state(self)
+        return {
+            "self_attn_s": float(self._linear_timing_stats["self_attn_s"]),
+            "other_linear_s": float(self._linear_timing_stats["other_linear_s"]),
+            "self_attn_ops": int(self._linear_timing_counts["self_attn_ops"]),
+            "other_linear_ops": int(self._linear_timing_counts["other_linear_ops"]),
+            "steps": int(self._linear_timing_step),
+        }
+
+    def maybe_report_linear_timing(self):
+        print_every_raw = os.getenv(_LINEAR_TIMING_PRINT_EVERY_ENV, "0")
+        try:
+            print_every = int(print_every_raw)
+        except ValueError:
+            print_every = 0
+
+        if print_every <= 0:
+            return
+        if self._linear_timing_step % print_every != 0:
+            return
+
+        stats = self.get_linear_timing_stats()
+        logger.info(
+            "[LinearTiming] steps=%d self_attn_s=%.6f other_linear_s=%.6f attn_ops=%d other_ops=%d",
+            stats["steps"],
+            stats["self_attn_s"],
+            stats["other_linear_s"],
+            stats["self_attn_ops"],
+            stats["other_linear_ops"],
+        )
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -492,6 +700,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
+        record_linear_time = flash_attn_kwargs.pop("record_linear_time", None)
+        if record_linear_time is None:
+            record_linear_time = _is_truthy(os.getenv(_LINEAR_TIMING_ENV, "0"))
+        self._record_linear_time = bool(record_linear_time)
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -602,6 +815,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+        if self._record_linear_time:
+            self._linear_timing_step += 1
+            self.maybe_report_linear_timing()
+
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -616,7 +833,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
 
 
-class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
+try:
+    class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs):
+        ...
+except TypeError:
+    # Fallback for transformers/typing combinations where mixed TypedDict bases conflict.
+    class KwargsForCausalLM(FlashAttentionKwargs):
+        ...
 
 
 @auto_docstring
@@ -651,6 +874,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
+
+    def reset_linear_timing_stats(self):
+        self.model.reset_linear_timing_stats()
+
+    def get_linear_timing_stats(self) -> Dict[str, Union[int, float]]:
+        return self.model.get_linear_timing_stats()
 
     @can_return_tuple
     @auto_docstring
@@ -713,7 +942,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        timer = _linear_timer_start(hidden_states, getattr(self.model, "_record_linear_time", False))
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        _linear_timer_end(self.model, "other_linear_s", "other_linear_ops", timer, 1, logits)
 
         loss = None
         if labels is not None:
