@@ -7,8 +7,6 @@ import argparse
 import json
 import os
 import time
-import sys
-import traceback
 
 import shortuuid
 from fastchat.llm_judge.common import load_questions
@@ -353,30 +351,21 @@ def get_model_answers(
     temperature,
     args,
 ):
-    try:
-        model = EaModel.from_pretrained(
-            base_model_path=base_model_path,
-            ea_model_path=ea_model_path,
-            total_token=args.total_token,
-            depth=args.depth,
-            top_k=args.top_k,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-            device_map="auto",
-            use_eagle3=args.use_eagle3,
-        )
+    model = EaModel.from_pretrained(
+        base_model_path=base_model_path,
+        ea_model_path=ea_model_path,
+        total_token=args.total_token,
+        depth=args.depth,
+        top_k=args.top_k,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        device_map="auto",
+        use_eagle3=args.use_eagle3,
+    )
 
-        tokenizer = model.get_tokenizer()
-        model.eval()
-        print("Check model training state:", model.training)
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print(f"ERROR: GPU Out of Memory during model loading!", file=sys.stderr)
-            print(f"Details: {str(e)}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            sys.exit(1)
-        else:
-            raise
+    tokenizer = model.get_tokenizer()
+    model.eval()
+    print("Check model training state:", model.training)
 
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     print("CUDA VISIBLE DEVICES:", cuda_visible_devices)
@@ -402,22 +391,13 @@ def get_model_answers(
 
             torch.cuda.synchronize()
             start_time = time.time()
-            try:
-                output_ids, new_token, idx = model.naivegenerate(
-                    torch.as_tensor(input_ids).cuda(),
-                    temperature=temperature,
-                    max_length=args.max_length,
-                    max_new_tokens=max_new_token,
-                    log=True,
-                )
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    print(f"ERROR: GPU Out of Memory during inference (warmup)!", file=sys.stderr)
-                    print(f"Input shape: {input_ids.shape}, Length: {len(input_ids[0])}", file=sys.stderr)
-                    traceback.print_exc(file=sys.stderr)
-                    sys.exit(1)
-                else:
-                    raise
+            output_ids, new_token, idx = model.naivegenerate(
+                torch.as_tensor(input_ids).cuda(),
+                temperature=temperature,
+                max_length=args.max_length,
+                max_new_tokens=max_new_token,
+                log=True,
+            )
             torch.cuda.synchronize()
             total_time = time.time() - start_time
             output_ids = output_ids[0][len(input_ids[0]) :]
@@ -474,24 +454,14 @@ def get_model_answers(
 
                 torch.cuda.synchronize()
                 start_time = time.time()
-                try:
-                    output_ids, new_token, idx = model.naivegenerate(
-                        torch.as_tensor(input_ids).cuda(),
-                        temperature=temperature,
-                        max_length=args.max_length,
-                        max_new_tokens=max_new_token,
-                        log=True,
-                        attn_debug=args.attn_debug,
-                    )
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
-                        print(f"ERROR: GPU Out of Memory during inference!", file=sys.stderr)
-                        print(f"Question ID: {question['question_id']}, Choice: {i}, Turn: {j}", file=sys.stderr)
-                        print(f"Input shape: {input_ids.shape}, Max new tokens: {max_new_token}", file=sys.stderr)
-                        traceback.print_exc(file=sys.stderr)
-                        sys.exit(1)
-                    else:
-                        raise
+                output_ids, new_token, idx = model.naivegenerate(
+                    torch.as_tensor(input_ids).cuda(),
+                    temperature=temperature,
+                    max_length=args.max_length,
+                    max_new_tokens=max_new_token,
+                    log=True,
+                    attn_debug=args.attn_debug,
+                )
                 torch.cuda.synchronize()
                 total_time = time.time() - start_time
                 output_ids = output_ids[0][len(input_ids[0]) :]
@@ -741,38 +711,21 @@ if __name__ == "__main__":
 
     print(f"Output to {answer_file}")
 
-    try:
-        run_eval(
-            args.base_model_path,
-            args.ea_model_path,
-            args.model_id,
-            question_file,
-            args.question_begin,
-            args.question_end,
-            answer_file,
-            args.max_new_token,
-            args.num_choices,
-            args.num_gpus_per_model,
-            args.num_gpus_total,
-            args.max_gpu_memory,
-            args.temperature,
-            args,
-        )
+    run_eval(
+        args.base_model_path,
+        args.ea_model_path,
+        args.model_id,
+        question_file,
+        args.question_begin,
+        args.question_end,
+        answer_file,
+        args.max_new_token,
+        args.num_choices,
+        args.num_gpus_per_model,
+        args.num_gpus_total,
+        args.max_gpu_memory,
+        args.temperature,
+        args,
+    )
 
-        reorg_answer_file(answer_file)
-    except MemoryError as e:
-        print(f"ERROR: System Out of Memory!", file=sys.stderr)
-        print(f"Details: {str(e)}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        sys.exit(1)
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print(f"ERROR: GPU Out of Memory!", file=sys.stderr)
-            print(f"Details: {str(e)}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            sys.exit(1)
-        else:
-            raise
-    except KeyboardInterrupt:
-        print("\nInterrupted by user", file=sys.stderr)
-        sys.exit(1)
+    reorg_answer_file(answer_file)
