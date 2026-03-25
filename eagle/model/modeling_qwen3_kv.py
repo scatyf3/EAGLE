@@ -85,6 +85,19 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 logger = logging.get_logger(__name__)
 
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+    from flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
+    _HAS_FLASH_ATTN = True
+except ImportError:
+    _HAS_FLASH_ATTN = False
+
+try:
+    from .triton_tree_attn import attention as _triton_tree_attn
+    _HAS_TRITON_TREE_ATTN = True
+except ImportError:
+    _HAS_TRITON_TREE_ATTN = False
+
 _LINEAR_TIMING_ENV = "EAGLE_RECORD_LINEAR_TIME"
 _LINEAR_TIMING_PRINT_EVERY_ENV = "EAGLE_RECORD_LINEAR_TIME_PRINT_EVERY"
 
@@ -426,6 +439,8 @@ class Qwen3Attention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         timer_attn = _linear_timer_start(query_states, enable_timing)
+        new_key_states = key_states
+        new_val_states = value_states
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -433,21 +448,76 @@ class Qwen3Attention(nn.Module):
             key_states = past_key_value[0].cat(key_states, dim=2)
             value_states = past_key_value[1].cat(value_states, dim=2)
         past_key_value = None
-        
-        attention_interface: Callable = eager_attention_forward
-        # if self.config._attn_implementation != "eager":
-        #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
+
+        output_attentions = kwargs.get("output_attentions", False)
+        q_len = query_states.shape[2]
+        kv_seq_len = key_states.shape[2]
+        prefix_len = kv_seq_len - q_len
+
+        use_fast_path = False
+        if _HAS_FLASH_ATTN and not output_attentions and q_len > 1:
+            if prefix_len > 0 and _HAS_TRITON_TREE_ATTN:
+                q_fa = query_states.transpose(1, 2).contiguous()
+                pk_fa = key_states[:, :, :prefix_len, :].transpose(1, 2).contiguous()
+                pv_fa = value_states[:, :, :prefix_len, :].transpose(1, 2).contiguous()
+
+                cache_seqlens = torch.full((q_fa.shape[0],), prefix_len, dtype=torch.int32, device=q_fa.device)
+                prefix_out, prefix_lse = _flash_attn_with_kvcache(
+                    q_fa,
+                    pk_fa,
+                    pv_fa,
+                    cache_seqlens=cache_seqlens,
+                    causal=False,
+                    return_softmax_lse=True,
+                )
+
+                if attention_mask is not None:
+                    tree_mask = (attention_mask[:, 0, :, -q_len:] > -1e30).contiguous()
+                else:
+                    tree_mask = torch.ones(
+                        q_fa.shape[0], q_len, q_len, dtype=torch.bool, device=query_states.device
+                    )
+
+                tree_out, tree_lse = _triton_tree_attn(
+                    query_states.contiguous(),
+                    new_key_states.contiguous(),
+                    new_val_states.contiguous(),
+                    tree_mask,
+                )
+                if prefix_lse.dim() == 4:
+                    prefix_lse = prefix_lse.squeeze(-1)
+
+                mix_weight = torch.sigmoid(prefix_lse - tree_lse).unsqueeze(-1)
+                prefix_out = prefix_out.permute(0, 2, 1, 3).to(torch.float32)
+                attn_output = (
+                    prefix_out * mix_weight + tree_out.to(torch.float32) * (1.0 - mix_weight)
+                ).to(query_states.dtype)
+                use_fast_path = True
+            elif prefix_len == 0:
+                attn_output = _flash_attn_func(
+                    query_states.transpose(1, 2).contiguous(),
+                    key_states.transpose(1, 2).contiguous(),
+                    value_states.transpose(1, 2).contiguous(),
+                    causal=True,
+                ).permute(0, 2, 1, 3)
+                use_fast_path = True
+
+        if use_fast_path:
+            attn_weights = None
+            attn_output = attn_output.transpose(1, 2).contiguous()
+        else:
+            attention_interface: Callable = eager_attention_forward
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
         _linear_timer_end(owner, "self_attn_s", "self_attn_ops", timer_attn, 1, attn_output)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
