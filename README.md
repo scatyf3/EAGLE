@@ -133,6 +133,14 @@ EAGLE has been merged in the following mainstream LLM serving frameworks (listed
   - [Train the Auto-regression Head](#train-the-auto-regression-head)
   - [Inference on custom models](#inference-on-custom-models)
 - [Evaluation](#evaluation)
+- [Long-Context Benchmark (Repo Specific)](#long-context-benchmark-repo-specific)
+
+
+## Long-Context Benchmark (Repo Specific)
+
+For the repo-specific long-context benchmark workflow used in this workspace (dataset buckets, 8k+ data, and unified run commands for AR/EAGLE/EAGLE-small/EAGLE-linear/TriForce), see:
+
+- [`README_LONGCONTEXT_BENCH.md`](README_LONGCONTEXT_BENCH.md)
 
 
 ## Setup & Installation

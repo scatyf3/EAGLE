@@ -29,6 +29,12 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func_draft
+    _HAS_FLASH_ATTN_DRAFT = True
+except ImportError:
+    _HAS_FLASH_ATTN_DRAFT = False
+
 from transformers.activations import ACT2FN
 from huggingface_hub import hf_hub_download
 
@@ -343,37 +349,49 @@ class LlamaAttention(nn.Module):
 
         past_key_value = (key_states, value_states) if use_cache else None
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # ── Flash-Attn path: use when no tree-mask attention (attention_mask is None) ──
+        if _HAS_FLASH_ATTN_DRAFT and not output_attentions and attention_mask is None:
+            q_fa = query_states.transpose(1, 2).contiguous()
+            k_fa = repeat_kv(key_states, self.num_key_value_groups).transpose(1, 2).contiguous()
+            v_fa = repeat_kv(value_states, self.num_key_value_groups).transpose(1, 2).contiguous()
+            attn_output = _flash_attn_func_draft(q_fa, k_fa, v_fa, causal=True)
+            _linear_timer_end(owner, "self_attn_s", "self_attn_ops", timer_attn, 1, attn_output)
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            attn_weights = None
+        else:
+            # ── Standard path (tree mask present or flash_attn unavailable) ──────
+            key_states_r   = repeat_kv(key_states,   self.num_key_value_groups)
+            value_states_r = repeat_kv(value_states, self.num_key_value_groups)
+            attn_weights = torch.matmul(query_states, key_states_r.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
                 )
-            attn_weights = attn_weights + attention_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
-        _linear_timer_end(owner, "self_attn_s", "self_attn_ops", timer_attn, 1, attn_output)
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    )
+                attn_weights = attn_weights + attention_mask
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_states_r)
+            _linear_timer_end(owner, "self_attn_s", "self_attn_ops", timer_attn, 1, attn_output)
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+                raise ValueError(
+                    f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                    f" {attn_output.size()}"
+                )
+
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            if not output_attentions:
+                attn_weights = None
 
         if self.config.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)

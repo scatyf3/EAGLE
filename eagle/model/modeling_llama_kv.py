@@ -33,6 +33,21 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
 
+# ── Optional flash-attention + Triton tree-verify ──────────────────────────────
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+    from flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
+except ImportError:
+    pass
+_HAS_FLASH_ATTN = False  # disabled: use standard attention path
+
+try:
+    from .triton_tree_attn import attention as _triton_tree_attn
+except ImportError:
+    pass
+_HAS_TRITON_TREE_ATTN = False  # disabled: use standard attention path
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -715,41 +730,119 @@ class LlamaAttention(nn.Module):
         # Reset past_key_value to avoid return past_key_value.
         past_key_value = None
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        # Save new key/value states BEFORE appending to cache (needed for Triton tree attention).
+        # key_states / value_states here are ONLY the current step's tokens (not past).
+        new_key_states = key_states   # (bsz, num_kv_heads, q_len, head_dim)
+        new_val_states = value_states
 
-        attn_weights = torch.matmul(
-            query_states, key_states.transpose(2, 3)
-        ) / math.sqrt(self.head_dim)
+        # prefix_len: number of valid KV tokens BEFORE this step (0 when no past_key_value)
+        prefix_len = kv_seq_len - q_len
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
+        # ── Flash-Attn + Triton tree-verify path ──────────────────────────────
+        use_fast_path = False
+        if _HAS_FLASH_ATTN and not output_attentions and q_len > 1:
+            if prefix_len > 0 and _HAS_TRITON_TREE_ATTN:
+                # Tree verification: split into prefix-attention (flash_attn_with_kvcache)
+                # and tree-to-tree attention (Triton kernel), then merge via LSE weighting.
+                q_fa  = query_states.transpose(1, 2).contiguous()    # (bsz, q_len, num_heads, head_dim)
+                pk_fa = key_states[:, :, :prefix_len, :].transpose(1, 2).contiguous()   # (bsz, prefix_len, num_kv_heads, head_dim)
+                pv_fa = value_states[:, :, :prefix_len, :].transpose(1, 2).contiguous() # same
 
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                cs = torch.full((bsz,), prefix_len, dtype=torch.int32, device=q_fa.device)
+                prefix_out, prefix_lse = _flash_attn_with_kvcache(
+                    q_fa, pk_fa, pv_fa,
+                    cache_seqlens=cs,
+                    causal=False,
+                    return_softmax_lse=True,
                 )
-            attn_weights = attn_weights + attention_mask
+                # prefix_out: (bsz, q_len, num_heads, head_dim)
+                # prefix_lse: (bsz, num_heads, q_len) or (bsz, num_heads, q_len, 1)
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+                # Extract tree-to-tree binary mask from the additive attention_mask.
+                # attention_mask last q_len columns encode the tree structure: 0=allow, -inf=block.
+                if attention_mask is not None:
+                    tm = (attention_mask[:, 0, :, -q_len:] > -1e30).contiguous()  # (bsz, q_len, q_len)
+                else:
+                    tm = torch.ones(bsz, q_len, q_len, dtype=torch.bool, device=query_states.device)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
+                # Triton tree attention: tree candidates attend to each other per tree structure.
+                # Kernel supports GQA (num_kv_heads < num_heads) natively via num_groups.
+                tree_out, tree_lse = _triton_tree_attn(
+                    query_states.contiguous(),    # (bsz, num_heads,    q_len, head_dim)
+                    new_key_states.contiguous(),  # (bsz, num_kv_heads, q_len, head_dim)
+                    new_val_states.contiguous(),  # same
+                    tm,              # (bsz, q_len, q_len) – int64, 1=attend 0=mask
+                )
+                # tree_out: (bsz, num_heads, q_len, head_dim)
+                # tree_lse: (bsz, num_heads, q_len)
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+                # Normalise prefix_lse to 3-D if flash_attn returns 4-D
+                if prefix_lse.dim() == 4:
+                    prefix_lse = prefix_lse.squeeze(-1)  # → (bsz, num_heads, q_len)
+
+                # LSE-based numerically-stable merge of the two attention computations
+                weight    = torch.sigmoid(prefix_lse - tree_lse).unsqueeze(-1)  # (bsz, num_heads, q_len, 1)
+                prefix_t  = prefix_out.permute(0, 2, 1, 3).to(torch.float32)   # (bsz, num_heads, q_len, head_dim)
+                attn_output = (prefix_t * weight + tree_out.to(torch.float32) * (1.0 - weight)).to(query_states.dtype)
+                # attn_output: (bsz, num_heads, q_len, head_dim) – consistent with standard path
+                use_fast_path = True
+
+            elif prefix_len == 0:
+                # Prefill (prefix_len == 0, no past KV):
+                # plain causal flash attention over the full sequence.
+                q_fa = query_states.transpose(1, 2).contiguous()
+                k_fa = key_states.transpose(1, 2).contiguous()
+                v_fa = value_states.transpose(1, 2).contiguous()
+                attn_output = _flash_attn_func(q_fa, k_fa, v_fa, causal=True).permute(0, 2, 1, 3)
+                # attn_output: (bsz, num_heads, q_len, head_dim)
+                use_fast_path = True
+
+        if use_fast_path:
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            if not output_attentions:
+                attn_weights = None
+
+        else:
+            # ── Standard path (q_len == 1 or flash_attn unavailable) ──────────
+            # repeat k/v heads if n_kv_heads < n_heads
+            key_states   = repeat_kv(key_states,   self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+            attn_weights = torch.matmul(
+                query_states, key_states.transpose(2, 3)
+            ) / math.sqrt(self.head_dim)
+
+            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
+                )
+
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    )
+                attn_weights = attn_weights + attention_mask
+
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_states)
+
+            if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+                raise ValueError(
+                    f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                    f" {attn_output.size()}"
+                )
+
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            if not output_attentions:
+                attn_weights = None
+        # ── End attention paths ────────────────────────────────────────────────
 
         if self.pretraining_tp > 1:
             attn_output = attn_output.split(
