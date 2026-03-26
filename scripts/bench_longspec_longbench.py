@@ -114,11 +114,18 @@ def main():
     parser.add_argument("--skip-baseline", action="store_true")
     args = parser.parse_args()
 
-    from transformers import AutoTokenizer, AutoConfig
+    from transformers import AutoTokenizer, LlamaConfig, PretrainedConfig
     from llama_glide import LlamaGlide
 
     print(f"[LongSpec] Loading {args.target_model} + {args.draft_model} ...")
-    config = AutoConfig.from_pretrained(args.target_model)
+    cfg_dict, _ = PretrainedConfig.get_config_dict(args.target_model)
+    rope = cfg_dict.get("rope_scaling")
+    if isinstance(rope, dict) and "type" in rope and "factor" in rope:
+        rope_type = rope["type"]
+        if rope_type == "yarn":
+            rope_type = "linear"
+        cfg_dict["rope_scaling"] = {"type": rope_type, "factor": rope["factor"]}
+    config = LlamaConfig.from_dict(cfg_dict)
     tokenizer = AutoTokenizer.from_pretrained(args.target_model)
 
     # Llama-3 tokens

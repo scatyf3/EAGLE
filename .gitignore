@@ -179,3 +179,5 @@ eagle/data/question_root_125/
 !eagle/data/longbench_ctx_sampled/question_8buckets_1k_128k.jsonl
 !eagle/data/longbench_ctx_sampled_1k_128k/
 !eagle/data/longbench_ctx_sampled_1k_128k/question.jsonl
+!eagle/data/longbench_ctx_subsampled_20/
+!eagle/data/longbench_ctx_subsampled_20/*.jsonl

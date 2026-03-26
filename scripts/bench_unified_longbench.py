@@ -197,20 +197,26 @@ def run_ar_method(args, samples, out_f):
 def run_eagle_method(args, samples, out_f):
     from eagle.model.ea_model import EaModel
 
-    print(f"[EAGLE] Loading {args.base_model} + {args.ea_model} ...")
+    total_token = args.eagle_total_token
+    depth       = args.eagle_depth
+    top_k       = args.eagle_top_k
+    method_tag  = args.method          # e.g. "eagle", "eagle-small", "eagle-linear"
+
+    print(f"[{method_tag.upper()}] Loading {args.base_model} + {args.ea_model} ...")
+    print(f"[{method_tag.upper()}] Config: total_token={total_token}, depth={depth}, top_k={top_k}")
     model = EaModel.from_pretrained(
         base_model_path=args.base_model,
         ea_model_path=args.ea_model,
-        total_token=-1,
-        depth=6,
-        top_k=10,
+        total_token=total_token,
+        depth=depth,
+        top_k=top_k,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
         use_eagle3=args.use_eagle3,
     ).eval()
     tokenizer = model.get_tokenizer()
-    print("[EAGLE] Model loaded.")
+    print(f"[{method_tag.upper()}] Model loaded.")
 
     def _run_one(ids):
         """Returns (wall, prefill_time, new_token, idx, accept_rate)."""
@@ -255,15 +261,16 @@ def run_eagle_method(args, samples, out_f):
         prefill_tps_list.append(pf_tps)
         total_tps_list.append(args.gen_len / wall)
 
-        rec = make_record("eagle", args.base_model, args.ea_model, sample, i,
+        rec = make_record(method_tag, args.base_model, args.ea_model, sample, i,
                           ctx_tokens, args.gen_len,
-                          wall, pf, dec, pf_tps, dec_tps, accept)
+                          wall, pf, dec, pf_tps, dec_tps, accept,
+                          eagle_total_token=total_token, eagle_depth=depth, eagle_top_k=top_k)
         out_f.write(json.dumps(rec) + "\n")
         out_f.flush()
-        _print_sample(i, len(samples), "EAGLE", ctx_tokens, args.gen_len,
+        _print_sample(i, len(samples), method_tag.upper(), ctx_tokens, args.gen_len,
                       wall, pf, dec, pf_tps, dec_tps, accept)
 
-    _print_final("EAGLE", args.base_model, len(samples),
+    _print_final(method_tag.upper(), args.base_model, len(samples),
                  decode_tps_list, prefill_tps_list, total_tps_list)
 
 
@@ -363,16 +370,39 @@ def run_triforce_method(args, samples, out_f):
         prefill_tps_list.append(pf_tps)
         total_tps_list.append(args.gen_len / wall)
 
+        # ── two-stage acceptance metrics ─────────────────────────────────────
+        # Stage 1: 68M draft  →  retrieval-7B verify  (inside Middle_Spec)
+        # Stage 2: retrieval-7B draft  →  full-7B verify  (outer TriForce loop)
+        #
+        # *_total_*  : cumulative counts over the whole decode run
+        # *_rate     : per-token acceptance rate
+        # *_avg_acc_len : avg tokens accepted per outer drafting step = rate * gamma
+        # ─────────────────────────────────────────────────────────────────────
+        s1_acc   = stage_stats.get("stage1_accepted_len")   # total accepted by retrieval
+        s1_prop  = stage_stats.get("stage1_proposed_len")   # total proposed by 68M
+        s1_rate  = (s1_acc / s1_prop) if (s1_acc is not None and s1_prop) else None
+
+        s2_acc   = stage_stats.get("stage2_accepted_len")   # total accepted by full-7B
+        s2_prop  = stage_stats.get("stage2_proposed_len")   # total proposed by retrieval (=draft_count)
+        s2_rate  = (s2_acc / s2_prop) if (s2_acc is not None and s2_prop) else None
+
+        # n_outer_steps ≈ s2_prop / gamma  (retrieval always proposes gamma tokens)
+        n_steps = s2_prop / gamma if (s2_prop and gamma > 0) else None
+        s1_avg_acc_len = (s1_acc / n_steps) if (s1_acc is not None and n_steps) else None
+        s2_avg_acc_len = (s2_rate * gamma)  if s2_rate is not None else None
+
         rec = make_record("triforce", args.base_model, args.draft_model, sample, i,
                           ctx_tokens, args.gen_len,
                           wall, pf, dec, pf_tps, dec_tps, accept,
                           budget=args.budget, gamma=gamma,
-                          stage1_acceptance_rate=stage_stats.get("stage1_acceptance_rate"),
-                          stage1_accepted_len=stage_stats.get("stage1_accepted_len"),
-                          stage1_proposed_len=stage_stats.get("stage1_proposed_len"),
-                          stage2_acceptance_rate=stage_stats.get("stage2_acceptance_rate"),
-                          stage2_accepted_len=stage_stats.get("stage2_accepted_len"),
-                          stage2_proposed_len=stage_stats.get("stage2_proposed_len"))
+                          s1_rate=s1_rate,
+                          s1_avg_acc_len=s1_avg_acc_len,
+                          s1_total_acc=s1_acc,
+                          s1_total_prop=s1_prop,
+                          s2_rate=s2_rate,
+                          s2_avg_acc_len=s2_avg_acc_len,
+                          s2_total_acc=s2_acc,
+                          s2_total_prop=s2_prop)
         out_f.write(json.dumps(rec) + "\n")
         out_f.flush()
         _print_sample(i, len(samples), "TriForce", ctx_tokens, args.gen_len,
@@ -409,7 +439,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Unified AR / EAGLE / TriForce latency benchmark."
     )
-    parser.add_argument("--method", required=True, choices=["ar", "eagle", "triforce"])
+    parser.add_argument("--method", required=True,
+                        choices=["ar", "eagle", "eagle-small", "eagle-linear", "triforce"])
     # Data
     parser.add_argument("--data", default="outputs/longbench_hip_prompt_gt_25000_qwen3.jsonl")
     parser.add_argument("--n-samples", type=int, default=10)
@@ -425,14 +456,21 @@ def main():
     parser.add_argument("--temperature",        type=float, default=0.6)
     parser.add_argument("--top-p",              type=float, default=0.9)
     # EAGLE-specific
-    parser.add_argument("--top-k",     type=int, default=-1)
-    parser.add_argument("--max-length", type=int, default=8192,
+    parser.add_argument("--top-k",     type=int, default=-1,
+                        help="EAGLE tree top-k (overridden by method presets)")
+    parser.add_argument("--max-length", type=int, default=16384,
                         help="Max total sequence length for EAGLE KV cache")
     parser.add_argument("--use-eagle3", action="store_true")
+    parser.add_argument("--eagle-total-token", type=int, default=None,
+                        help="EAGLE total_token budget (-1=auto, overridden by method presets)")
+    parser.add_argument("--eagle-depth", type=int, default=None,
+                        help="EAGLE draft tree depth (overridden by method presets)")
+    parser.add_argument("--eagle-top-k", type=int, default=None,
+                        help="EAGLE draft tree top-k (overridden by method presets)")
     # TriForce-specific
     parser.add_argument("--prefill",    type=int, default=3000,
                         help="Fixed context length for TriForce CUDA graph")
-    parser.add_argument("--budget",     type=int, default=2048,
+    parser.add_argument("--budget",     type=int, default=None,
                         help="TriForce retrieval KV budget")
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--gamma",      type=int, default=6,
@@ -445,9 +483,37 @@ def main():
     parser.add_argument("--output", default="outputs/bench_unified_result.jsonl")
     args = parser.parse_args()
 
+    # ── EAGLE method presets ──────────────────────────────────────────────────
+    # "eagle"        : full tree, total_token auto-search, depth=6, top_k=10
+    # "eagle-small"  : small tree, total_token=6, depth=4, top_k=10
+    # "eagle-linear" : linear chain, no tree branching, top_k=1,
+    #                  depth=gamma, total_token=gamma
+    if args.method in ("eagle", "eagle-small", "eagle-linear"):
+        if args.method == "eagle":
+            # defaults unless manually overridden
+            if args.eagle_total_token is None: args.eagle_total_token = -1
+            if args.eagle_depth       is None: args.eagle_depth       = 6
+            if args.eagle_top_k       is None: args.eagle_top_k       = 10
+        elif args.method == "eagle-small":
+            if args.eagle_total_token is None: args.eagle_total_token = 6
+            if args.eagle_depth       is None: args.eagle_depth       = 4
+            if args.eagle_top_k       is None: args.eagle_top_k       = 10
+        elif args.method == "eagle-linear":
+            # Linear = chain of gamma tokens, no branching (top_k=1)
+            if args.eagle_total_token is None: args.eagle_total_token = args.gamma
+            if args.eagle_depth       is None: args.eagle_depth       = args.gamma
+            if args.eagle_top_k       is None: args.eagle_top_k       = 1
+        print(f"[{args.method}] Config: total_token={args.eagle_total_token}, "
+              f"depth={args.eagle_depth}, top_k={args.eagle_top_k}")
+
     # Sync max-input-tokens / prefill for TriForce
     if args.method == "triforce":
         args.max_input_tokens = args.prefill
+        if args.budget is None:
+            raw_budget = args.prefill // 4
+            aligned_budget = (raw_budget // args.chunk_size) * args.chunk_size
+            args.budget = max(args.chunk_size, aligned_budget)
+        print(f"[TriForce] Config: prefill={args.prefill}, budget={args.budget}, chunk_size={args.chunk_size}, use_draft={args.use_draft}")
 
     data_path = os.path.join(ROOT, args.data) if not os.path.isabs(args.data) else args.data
     with open(data_path) as f:
@@ -459,7 +525,7 @@ def main():
     with open(args.output, "w") as out_f:
         if args.method == "ar":
             run_ar_method(args, samples, out_f)
-        elif args.method == "eagle":
+        elif args.method in ("eagle", "eagle-small", "eagle-linear"):
             run_eagle_method(args, samples, out_f)
         elif args.method == "triforce":
             run_triforce_method(args, samples, out_f)
